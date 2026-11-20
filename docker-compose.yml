@@ -1,0 +1,14 @@
+services:
+  s3-proxy:
+    build: .
+    container_name: s3-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT}:${PORT}"
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      CLOUD_ACCESS_KEY: ${CLOUD_ACCESS_KEY}
+      CLOUD_SECRET_KEY: ${CLOUD_SECRET_KEY}
+      CLOUD_ENDPOINT: ${CLOUD_ENDPOINT}
+      CLOUD_REGION: ${CLOUD_REGION}
