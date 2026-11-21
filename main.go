@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
+
+type completeMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr,omitempty"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+}
 
 func main() {
 	minioAccess := os.Getenv("MINIO_ACCESS_KEY")
@@ -69,10 +79,10 @@ func main() {
 			for k := range req.Header {
 				lk := strings.ToLower(k)
 				if strings.HasPrefix(lk, "x-forwarded-") ||
+					strings.HasPrefix(lk, "x-amz-") ||
 					lk == "x-real-ip" ||
 					lk == "forwarded" ||
-					lk == "authorization" ||
-					lk == "x-amz-security-token" {
+					lk == "authorization" {
 					req.Header.Del(k)
 				}
 			}
@@ -80,10 +90,6 @@ func main() {
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
 			req.Host = targetURL.Host
-
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Forwarded-Proto")
-			req.Header.Del("X-Forwarded-Host")
 
 			now := time.Now().UTC()
 			if isPresigned {
@@ -136,6 +142,16 @@ func main() {
 			} else {
 				req.Header.Set("X-Amz-Date", now.Format("20060102T150405Z"))
 				payloadHash := "UNSIGNED-PAYLOAD"
+				if req.Body != nil && req.Body != http.NoBody {
+					bodyBytes, err := io.ReadAll(req.Body)
+					if err == nil {
+						req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+						req.ContentLength = int64(len(bodyBytes))
+						sum := sha256.Sum256(bodyBytes)
+						payloadHash = hex.EncodeToString(sum[:])
+					}
+				}
+
 				req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 				if err := signer.SignHTTP(
@@ -167,6 +183,9 @@ type authTransport struct {
 }
 
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	origLocBase := req.Header.Get("X-Orig-Location-Base")
+	req.Header.Del("X-Orig-Location-Base")
+
 	if errMsg := req.Header.Get("X-Internal-Auth-Err"); errMsg != "" {
 		xmlErr := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>SignatureDoesNotMatch</Code><Message>%s</Message></Error>`, errMsg)
 		return &http.Response{
@@ -175,7 +194,88 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			Body:       io.NopCloser(strings.NewReader(xmlErr)),
 		}, nil
 	}
-	return t.rt.RoundTrip(req)
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil {
+		log.Printf("[UPSTREAM ERR] %s %s -> %v", req.Method, req.URL.RequestURI(), err)
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		log.Printf("[UPSTREAM %d] %s %s -> %s", resp.StatusCode, req.Method, req.URL.RequestURI(), string(bodyBytes))
+		return resp, nil
+	}
+
+	if req.Method == http.MethodPost && strings.Contains(req.URL.RawQuery, "uploadId=") {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("[COMPLETE MULTIPART RAW %d] uri=%s body=%q", resp.StatusCode, req.URL.RequestURI(), string(bodyBytes))
+
+		parts := strings.SplitN(strings.TrimPrefix(req.URL.Path, "/"), "/", 2)
+		bucket, key := "", ""
+		if len(parts) == 2 {
+			bucket, key = parts[0], parts[1]
+		}
+		if origLocBase == "" {
+			origLocBase = "https://" + req.Host
+		}
+		defaultLocation := fmt.Sprintf("%s/%s/%s", origLocBase, bucket, key)
+
+		var parsed completeMultipartUploadResult
+		if err := xml.Unmarshal(bodyBytes, &parsed); err != nil {
+			etag := resp.Header.Get("ETag")
+			if etag == "" {
+				etag = `"00000000000000000000000000000000-1"`
+			}
+			if !strings.HasPrefix(etag, `"`) {
+				etag = `"` + etag + `"`
+			}
+			parsed = completeMultipartUploadResult{
+				Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+				Location: defaultLocation,
+				Bucket:   bucket,
+				Key:      key,
+				ETag:     etag,
+			}
+		} else {
+			if parsed.Xmlns == "" {
+				parsed.Xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
+			}
+			if strings.TrimSpace(parsed.Location) == "" {
+				parsed.Location = defaultLocation
+			}
+			if strings.TrimSpace(parsed.Bucket) == "" {
+				parsed.Bucket = bucket
+			}
+			if strings.TrimSpace(parsed.Key) == "" {
+				parsed.Key = key
+			}
+			etag := strings.TrimSpace(parsed.ETag)
+			if etag == "" {
+				etag = strings.TrimSpace(resp.Header.Get("ETag"))
+			}
+			if etag == "" {
+				etag = "00000000000000000000000000000000-1"
+			}
+			if !strings.HasPrefix(etag, `"`) {
+				etag = `"` + etag + `"`
+			}
+			parsed.ETag = etag
+		}
+
+		outXML, marshalErr := xml.Marshal(parsed)
+		if marshalErr == nil {
+			fixedBody := xml.Header + string(outXML)
+			log.Printf("[COMPLETE MULTIPART FIXED] body=%q", fixedBody)
+			resp.Body = io.NopCloser(strings.NewReader(fixedBody))
+			resp.ContentLength = int64(len(fixedBody))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(fixedBody)))
+			resp.Header.Set("Content-Type", "application/xml")
+			return resp, nil
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+	return resp, nil
 }
 
 func verifySigV4(r *http.Request, expectedAccess, expectedSecret string) error {
